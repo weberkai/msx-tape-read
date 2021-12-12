@@ -1,0 +1,651 @@
+#!/usr/bin/perl
+#############################################################################
+## MSX tape wav file to text decoder
+## Copyright (C) 2021 Weber Kai.
+## Email: weberkai@yahoo.com.br
+##
+## This software was created from the software below
+##
+## Tape wav file to text decoder
+## Copyright (C) 2006 Martin Ward.
+## Email: martin@gkc.org.uk
+##
+## This program is free software; you can redistribute it and/or modify
+## it under the terms of the GNU General Public License as published by
+## the Free Software Foundation; either version 2 of the License, or
+## (at your option) any later version.
+##
+## This program is distributed in the hope that it will be useful,
+## but WITHOUT ANY WARRANTY; without even the implied warranty of
+## MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+## GNU General Public License for more details.
+##
+## You should have received a copy of the GNU General Public License
+## along with this program; if not, write to the Free Software
+## Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
+#############################################################################
+# Read a wav file recording of a UK101 or similar tape in Kansas City format.
+# A '0' bit is represented as one cycle of a 1200 Hz sine wave,
+# and a '1' bit as two cycles of 2400 Hz. This gives a data rate of 1200 bauds.
+# Carrier wave is 1 bits (1200Hz)
+# Each frame starts with one start bit (a '0')
+# followed by eight data bits (least significat bit first)
+# followed by two stop bits ('1's)
+# So each frame is 11 bits, for a data rate of 109 bytes per second.
+
+# MSX tape wav file to text decoder versions
+# Version 1.00: First Public Release
+#
+# Tape wav file to text decoder versions
+# Version 1.00: First Public Release
+# Version 1.10: Various fixes
+# Version 1.20: Improvements to handle speed variations
+
+# A typical wav file is 44100Hz sampling rate, stereo, 16 bit PCM
+# (i.e. standard CD format).
+# One cycle at 2400Hz is 18.375 samples
+# One cycle at 1200 Hz is 36.75 samples
+# One bit is 147 samples
+# One frame is 147*11 = 1617 samples
+# With a 128 sample window, there can fit 6.966 waves of 2400Hz signal
+# and 3.483 waves of 1200Hz signal
+# For 1200 baud, to fit one wave in a 64 bit window we need
+# to resample to 76800Hz
+# BBC Micro cassette tape appears to work with:
+# tape-read hi=2400 lo=1200 baud=1200 resample=64 frame=8N1 file.wav
+#
+# For Atari 400/800 tapes we need:
+# tape-read hi=5327 lo=3995 baud=600 frame=8N1 file.wav
+# See: http://www.atariarchives.org/dere/chaptC.php
+#
+# CUTS tapes can be hard to decode because the zero bit is only half a cycle
+# of the low frequency. The script has to analyse a two bit wide window.
+# Using the welch window function can help since it gives more weighting
+# to the centre of the window.
+# (1) Save the CUTS tapes at low volume (to avoid clipping) and a high bitrate
+# (2) Use a wav editer to work out the exact bit rate (1 cycle of high frequency)
+# (3) Resample to 64 or 128 samples per bit and use 8 or 16 steps per bit.
+# (4) Use a welch window. For example:
+# tape-read hi=1120 lo=560 baud=1120 resample=128 steps=32 window=welch file.wav
+
+# The challenge was to load the data from an old brazilian radio program which aired some MSX code
+# Rádio USP - Clip Informática - Episode: 102
+# The data starts at 25m00s from this video: https://www.youtube.com/watch?v=QSzMP64DPnI
+
+# First download the mp4 video from YT, then extract the aac audio with:
+# ffmpeg -i MSX.mp4 -vn -acodec copy MSX.aac
+# Then convert aac to wav:
+# ffmpeg -i MSX.aac MSX.wav
+# In Audacity cut only the MSX tape data
+# Finally use this code to read the data
+# perl taperead/tape-read baud=1250 hi=2500 lo=1250 window=welch MSX.wav
+# You should have 6 files now each one corresponding to a tape block
+
+use strict;
+use warnings;
+use Audio::Wav;
+use Math::FFT;
+
+sub average($);
+sub new_file();
+
+$| = 1; # Unbuffered output
+
+my $max = 0;        # Max number of samples to read from file
+my $print_data = 0; # Print the data bytes to stdout in sanitised form
+my $steps = 10;     # Number of FFT analysis steps per bit of data
+my $width = 128;    # 3.5 or 7 cycles per sample
+my $baud = 300;     # Baud rate (modulation changes per second)
+my $start_bits = 1;
+my $data_bits = 8;
+my $parity_bits = 0;  # Number of parity bits (0 or 1)
+my $parity_type = ""; # "E" or "O";
+my $stop_bits = 2;    # Number of stop bits per frame
+my $window = "hann";  # Window type
+my $resample = 0;     # Resample to this many samples per bit
+my $hi_hz = 2400;     # 1 bit/carrier/stop bit frequency in Hz
+my $lo_hz = 1200;     # 0 bit/start bit frequency in Hz
+my $keep = 0;         # Keep all data
+my $graph = 0;        # Plot a graph of frequency spectrum
+my $channel = "A";    # Channel to use (average)
+my $bitstream = 0;    # Generate a bit stream output
+
+# Using 128 samples for FFT analysis with a 44100Hz data rate
+# gives sharp peaks at positions 3+4 and 7 on the X axis of the spectrum plot.
+# Adding the window => 'hann' option seems to improve the results.
+
+(my $myname = $0) =~ s|(.*/)*||;        # strip path component from name
+
+my $Usage = "Usage: $myname [options] file\n" . <<'OPTIONS';
+Read a wav file and translate to one or more text files.
+This uses Fourier analysis to determine the points where the signal
+changes from low to high frequency, and vice versa.
+Options are:
+hi=N       High frequency (1 bit/carrier/stop bit) (default=2400Hz)
+lo=N       Low frequency (0 bit/start bit) (default=1200Hz)
+baud=N     Baud rate (default=300)
+CUTS       CUTS format (short for: hi=1200 lo=600 baud=1200)
+frame=Nxy  Format: N=data bits, x=parity (E/O/N), y=stop bits (default=8N2)
+max=N      Stop after reading N samples from the file
+steps=N    Compute N Fast Fourier Transform steps per bit (default=10)
+window=xxx FFT window function (none/bartlett/welch/hann) (default=hann)
+resample=N Resample wav file so that one bit is N samples (default=0)
+keep=Y/N   Keep all data, including short isolated sections? (default=N)
+graph=Y/N  Plot a graph of the frequency spectrum against time (default=N)
+channel=x  Channel to use (L=Left, R=Right, A=Average) (default=A)
+bit=Y/N    Generate a bit stream output as well as text files (default=N)
+OPTIONS
+
+# Check one or more arguments:
+die $Usage if ($#ARGV < 0);
+
+my $file = "";
+for (@ARGV) {
+  if (/^max=(\d+)$/) {
+    $max = $1;
+  } elsif (/^print_data=(.*)$/) {
+    $print_data=$1;
+  } elsif (/^steps=(\d+(\.\d*)?)$/) {
+    $steps = $1;
+  } elsif (/^hi=(\d+)$/) {
+    $hi_hz = $1;
+  } elsif (/^lo=(\d+)$/) {
+    $lo_hz = $1;
+  } elsif (/^baud=(\d+)$/) {
+    $baud = $1;
+  } elsif (/^frame=(\d+)([NEO])(\d*)$/) {
+    # Frame layout: data bits + parity + stop bits
+    # Eg 8N2 is 8 data bits, no parity, 2 stop bits
+    $data_bits = $1;
+    $parity_type = $2;
+    $stop_bits = $3;
+    if ($parity_type eq "N") {
+      $parity_bits = 0;
+    } else {
+      $parity_bits = 1;
+    }
+  } elsif (/^window=(.*)$/) {
+    $window = $1;
+  } elsif (/^CUTS=?(.*)$/) {
+    $baud = 1200;
+    $hi_hz = 1200;
+    $lo_hz = 600;
+  } elsif (/^resample=(\d+)$/) {
+    $resample = $1;
+  } elsif (/^keep=([ynYN])/) {
+    $keep = 1 if uc($1) eq "Y";
+  } elsif (/^graph=([ynYN])/) {
+    $graph = 1 if uc($1) eq "Y"
+  } elsif (/^channel=([lraLRA])$/) {
+    $channel = uc($1);
+  } elsif (/^bit=([ynYN])/) {
+    $bitstream = 1 if uc($1) eq "Y";
+  } elsif ($file eq "") {
+    $file = $_;
+  } else {
+    die $Usage;
+  }
+}
+die $Usage if $file eq "";
+
+my $base = $file;
+$base =~ s/\.wav$//;
+
+if ($resample) {
+  my $new_freq = $resample * $baud;
+  print "Resampling $file to $resample samples per bit (${new_freq}Hz).\n";
+  system qq[sox "$file" -r $new_freq "$base-r.wav" rate -v];
+  $file = "$base-r.wav";
+}
+
+print "Reading $file\n";
+
+my $wav = new Audio::Wav;
+my $read = $wav->read($file);
+
+my $info = $read->details();
+my $total_samples = $$info{data_length} / $$info{channels} /($$info{bits_sample}/8);
+my $freq = $$info{sample_rate}; # Sample frequency (Hz)
+my $samples_per_bit = int($freq/$baud + 0.5);
+my $step = int($freq/$baud/$steps + 0.5);
+$step = 1 if $step == 0;
+my $channels = $$info{channels};
+my $bit_width = $freq/$baud/$step;
+my $frame_bits = 1 + $data_bits + $parity_bits + $stop_bits;
+my $frame_width = $bit_width * $frame_bits;
+
+# Compute sample point width from baud rate and freq:
+$width = 1;
+$width *= 2 while ($width <= $freq/$baud);
+$width = $width / 2;
+
+# Compute lo and hi cycles per $width section
+# lo cycles per bit = 1200/$baud
+# hi cycles per bit = 2400/$baud
+
+my ($lo_freq, $lo_freq_n1, $lo_freq_a1, $lo_freq_n2, $lo_freq_a2);
+my ($hi_freq, $hi_freq_n1, $hi_freq_a1, $hi_freq_n2, $hi_freq_a2);
+
+if ($lo_hz < $baud) {
+  # We need to make the window up to 2 bits wide, since a 0 bit
+  # is less than one cycle
+  $width *= 2;
+}
+$lo_freq = $lo_hz * $width / $freq;
+$hi_freq = $hi_hz * $width / $freq;
+
+# Interpolate between int($lo_freq) and int(lo_freq + 1)
+$lo_freq_n1 = int($lo_freq);
+$lo_freq_n2 = int($lo_freq) + 1;
+$lo_freq_a1 = $lo_freq_n2 - $lo_freq;
+$lo_freq_a2 = 1 - $lo_freq_a1;
+if ($lo_freq_n1 == 0) {
+  $lo_freq_a1 = 0;
+  $lo_freq_a2 = 1;
+}
+# ditto for hi frequency:
+$hi_freq_n1 = int($hi_freq);
+$hi_freq_n2 = int($hi_freq) + 1;
+$hi_freq_a1 = $hi_freq_n2 - $hi_freq;
+$hi_freq_a2 = 1 - $hi_freq_a1;
+if ($hi_freq_n2 > $width/2) {
+  $hi_freq_n2 = $width/2;
+}
+
+print "Frequency = $freq, Baud = $baud, 1 bit = $samples_per_bit, ";
+print "FFT width = $width, FFT step = $step\n";
+
+printf("lo frequency = %.3f (%0.3f * s[%d] + %0.3f * s[%d])\n", $lo_freq,
+       $lo_freq_a1, $lo_freq_n1, $lo_freq_a2, $lo_freq_n2);
+printf("hi frequency = %.3f (%0.3f * s[%d] + %0.3f * s[%d])\n", $hi_freq,
+       $hi_freq_a1, $hi_freq_n1, $hi_freq_a2, $hi_freq_n2);
+
+my @data = ();
+my @datum;
+my $n = 0;
+while(@datum = $read->read()) {
+  if ($channels == 1) {
+    push(@data, $datum[0]);
+  } elsif ($channel eq "A") {
+    push(@data, $datum[0] + $datum[1]);
+  } elsif ($channel eq "L") {
+    push(@data, $datum[0]);
+  } else {
+    push(@data, $datum[1]);
+  }
+  $n++;
+  print "\rRead $n of $total_samples samples" if (($n % 10000) == 0);
+  last if $max && ($n > $max);
+}
+$n--;
+
+print "\rRead $n of $total_samples samples\n";
+
+my $total = $n;
+my $points = int(($total-$width)/$step) + 1;
+
+my @lo = (); # Low frequency (0 bit, start bit) component
+my @hi = (); # High frequency (1 bit, stop bit, carrier) component
+
+my $fft1 = new Math::FFT([(0) x $width]);
+
+foreach my $i (0..$points-1) {
+
+  print "\rStep ", $i + 1, " of $points points" if ((($i + 1) % 1000) == 0);
+
+  my @dat = @data[$i * $step .. $i * $step + $width - 1];
+
+  my $fft = $fft1->clone(\@dat);
+  my %options = ();
+  $options{window} = $window if $window ne "none";
+  my $spectrum = $fft->spctrm(%options);
+
+  #print "$i: @$spectrum\n";
+
+  if (($resample == 0) || ($lo_freq_a2 > 0) || ($hi_freq_a2 > 0)){
+
+    $lo[$i] = $lo_freq_a1 * $$spectrum[$lo_freq_n1]
+                + $lo_freq_a2 * $$spectrum[$lo_freq_n2];
+    $hi[$i] = $hi_freq_a1 * $$spectrum[$hi_freq_n1]
+                + $hi_freq_a2 * $$spectrum[$hi_freq_n2];
+
+  } else {
+
+    # Frequencies should be centred on n1
+    # Add either side to handle speed variations:
+
+    $lo[$i] = $$spectrum[$lo_freq_n1 - 1]
+                + $$spectrum[$lo_freq_n1]
+                + $$spectrum[$lo_freq_n1 + 1];
+    $hi[$i] = $$spectrum[$hi_freq_n1 - 1]
+                + $$spectrum[$hi_freq_n1]
+                + $$spectrum[$hi_freq_n1 + 1];
+  }
+
+} # next $i
+
+print "\n";
+
+# We have finished with @data, so free the memory:
+#undef @data;
+
+print "\n";
+print "Normalising Spectrum Analysis Points\n";
+
+# "Normalise" @lo and @hi
+my $avlo = average(\@lo);
+print "lo average = $avlo\n";
+my $avhi = average(\@hi);
+print "hi average = $avhi\n";
+
+# Delete initial points until we find a step where either $lo or $hi
+# is at least 10% of the average:
+$n = 0;
+$n++ while ($lo[$n] < $avlo/10) && ($hi[$n] < $avhi/10);
+
+if ($n > 0) {
+  print "Skipping initial $n points (", $n * $step, " samples)\n";
+  splice(@lo, 0, $n);
+  splice(@hi, 0, $n);
+  $points -= $n;
+}
+
+# Delete final points until we find a step where either $lo or $hi
+# is at least 10% of the average:
+$n = $points - 1;
+$n-- while ($lo[$n] < $avlo/10) && ($hi[$n] < $avhi/10);
+$n = $points - 1 - $n;
+
+if ($n > 0) {
+  print "Skipping final $n points (", $n * $step, " samples)\n";
+  splice(@lo, -$n);
+  splice(@hi, -$n);
+  $points -= $n;
+}
+
+# Use the averages to determine (roughly) which points are low
+# and which are high.
+# Compute new averages by counting only the low (or high) points.
+# Don't do this if we end up with < 8% of points low or < 8% high
+# (Typically, there must be at least one (start) bit per 11 bit frame)
+my ($lo_tot, $lo_num, $hi_tot, $hi_num);
+my (@avlo, @avhi);
+foreach my $j (1..5) {
+  $lo_tot = 0;
+  $lo_num = 0;
+  $hi_tot = 0;
+  $hi_num = 0;
+  for my $i (0..$points-1) {
+    if ($lo[$i]/$avlo > $hi[$i]/$avhi) {
+      # Low point
+      $lo_tot += $lo[$i];
+      $lo_num++;
+    } else {
+      # High point
+      $hi_tot += $hi[$i];
+      $hi_num++;
+    }
+  }
+  last unless $lo_num && $hi_num;
+  $avlo = $lo_tot / $lo_num;
+  $avhi = $hi_tot / $hi_num;
+  $avlo[$j] = $avlo;
+  $avhi[$j] = $avhi;
+  printf "lo average = %.3f over %d points\n", $avlo, $lo_num;
+  printf "hi average = %.3f over %d points\n", $avhi, $hi_num;
+}
+if (($lo_num * 100 / ($lo_num + $hi_num) < 8)
+    || ($hi_num * 100 / ($lo_num + $hi_num) < 8)) {
+  print "Iteration failed to converge to sensible values, restoring:\n";
+  $avlo = average(\@lo);
+  printf "lo average = %.3f\n", $avlo;
+  $avhi = average(\@hi);
+  printf "hi average = %.3f\n", $avhi;
+}
+print "\n";
+
+#$avlo = average(\@lo);$avhi = average(\@hi);
+
+# Compute the sequence of bit points:
+my @bit = ();
+for my $i (0..$points-1) {
+  if ($lo[$i] / $avlo > $hi[$i] / $avhi) {
+    $bit[$i] = 0;
+  } else {
+    $bit[$i] = 1;
+  }
+}
+
+#$avlo = average(\@lo);$avhi = average(\@hi);
+
+# Now we analyse the resulting sequence of bit points:
+# First, "smooth" the result by fixing isolated points, pairs or triples
+# (a single data bit should cover up to $steps points):
+
+if (!$graph) {
+  if ($steps >= 3) {
+    foreach my $i (1..$points-2) {
+      if (($bit[$i-1] != $bit[$i]) && ($bit[$i] != $bit[$i+1])) {
+        $bit[$i] = $bit[$i-1];
+      }
+    }
+  }
+  if ($steps >= 5) {
+    foreach my $i (1..$points-3) {
+      if (($bit[$i-1] != $bit[$i]) && ($bit[$i] == $bit[$i+1])
+            && ($bit[$i] != $bit[$i+2])) {
+        $bit[$i] = $bit[$i-1];
+        $bit[$i+1] = $bit[$i-1];
+      }
+    }
+  }
+  if ($steps >= 9) {
+    foreach my $i (1..$points-3) {
+      if (($bit[$i-1] != $bit[$i]) && ($bit[$i] == $bit[$i+1])
+            && ($bit[$i] == $bit[$i+2]) && ($bit[$i] != $bit[$i+3])) {
+        $bit[$i] = $bit[$i-1];
+        $bit[$i+1] = $bit[$i-1];
+        $bit[$i+2] = $bit[$i-1];
+      }
+    }
+  }
+}
+
+my $p = 0;      # Current posn
+my @files = (); # Assume files are separated by > 10 frames of carrier
+my @text = ();  # Decoded data characters
+
+my $last = 0;   # Position of the end of last frame
+
+open(BITS, ">$base.bit") if $bitstream;
+binmode(BITS) if $bitstream;
+
+# Loop over blocks in the data:
+BLOCK:
+for (;;) {
+  my $max_variance = 0;
+  my $bytes = 0;  # Number of bytes decoded
+  my $header = 0;
+  my $bit_w = $bit_width;
+  my $frame_w = $frame_width;
+  my $error = 0;
+  # wait for header
+  while ($p < $points && $bit[$p] == 0) {
+    $p++;
+  }
+  # pass header
+  while(($p < $points) && $bit[$p]) {
+    $p++;
+    $header++;
+  }
+  if ($p < $points && $header * 2 / $bit_w >= 1920) {
+    print "Block Start: header=", int($header * 2 / $bit_w), " (point=$p, sample=", int($p * $step), ")\n";
+    print BITS "1" x int($header/$bit_w) if $bitstream;
+    $last = $p;
+    # Loop over frames in the data:
+    # 0 = start bit, 1-8 = data bits, 9-10 = stop bits
+    FRAME:
+    for (;;) {
+      # At beginning of the start bit:
+      my $halfbit = 0;
+      my $stoptbit1pos = 0;
+      my $startbit = 0;
+      my $byte = 0;
+      my $stoptbit1 = 0;
+      my $stoptbit2 = 0;
+      $error = 1;
+      if ($p > $last){
+        # Try to account for speed variations:
+        $frame_w = $p - $last;
+        if ($p < $points - $frame_w) {
+          $bit_w = $frame_w / $frame_bits;
+          $halfbit = int($bit_w / 2);
+          $stoptbit1pos = $p + int((1 + $data_bits + $parity_bits) * $bit_w) + $halfbit;
+          $startbit = $bit[$p + $halfbit];
+          $stoptbit1 = $bit[$stoptbit1pos];
+          $stoptbit2 = $bit[$stoptbit1pos + $bit_w];
+          if ($startbit == 0 && $stoptbit1 == 1 && $stoptbit2 == 1) {
+            $error = 0;
+          }
+        }
+      }
+      if ($error != 0){
+        # Try to reset speed variation
+        $frame_w = $frame_width;
+        if ($p < $points - $frame_w) {
+          $bit_w = $frame_w / $frame_bits;
+          $halfbit = int($bit_w / 2);
+          $stoptbit1pos = $p + int((1 + $data_bits + $parity_bits) * $bit_w) + $halfbit;
+          $startbit = $bit[$p + $halfbit];
+          $stoptbit1 = $bit[$stoptbit1pos];
+          $stoptbit2 = $bit[$stoptbit1pos + $bit_w];
+          if ($startbit == 0 && $stoptbit1 == 1 && $stoptbit2 == 1) {
+            $error = 0;
+          }
+        }
+      }
+      if ($error == 0) {
+        if ($frame_w != $frame_width) {
+          my $variance = abs($frame_w - $frame_width)/$frame_width;
+          if (($variance > $max_variance)) {
+            print "frame_w=$frame_w, frame_width=$frame_width, variance=$variance (point=$p, last=$last, sample=", int($p * $step), ")\n";
+            $max_variance = $variance;
+          }
+        }
+
+        # Read $data_bits data bits (LSB to MSB):
+        my $pow = 1;  # Power of 2 for the current bit
+        foreach my $i (1..$data_bits) {
+          my $readbit = $bit[$p + int($i * $bit_w) + $halfbit];
+          $byte += $readbit * $pow;
+          # Print raw bitstream if required:
+          print BITS $readbit * $pow if ($bitstream);
+          $pow *= 2;
+        }
+
+        #Save to output
+        push(@text, chr($byte));
+        $bytes++;
+
+        # Print the byte in a sanitised format (skip \cM and nulls):
+        if ($print_data && ($byte != 0) && ($byte != 13)) {
+          if ($byte == 10) {
+            print "\n";
+          } elsif (($byte < 31) || ($byte > 126)) {
+            printf("<%02X>", $byte);
+          } else {
+            print chr($byte);
+          }
+        }
+        
+        # Save position
+        $last = $p;
+        # Skip to middle of first stop bit:
+        $p = $stoptbit1pos;
+        # pass all stop bits, stop at beginning of the start bit
+        while($bit[$p]) {
+          $p++;
+        }
+      } else {
+        print "Error at byte $bytes, startbit=$startbit, byte=$byte, stoptbit1=$stoptbit1, stoptbit2=$stoptbit2 (point $p, sample ", int($p * $step), ")\n";
+        last;
+      }
+    }
+  }
+  if ($bytes != 0) {
+    print "$bytes bytes decoded.\n";
+    print "maximum speed variance: $max_variance\n";
+    # start a new file:
+    new_file();
+  }
+  last if $p >= $points;
+}
+
+# Save any remaining data:
+new_file();
+close(BITS) if $bitstream;
+
+# Write the data:
+foreach my $i (0..$#files) {
+  my $name = sprintf("$base-%03d.txt", $i + 1);
+  print "Writing file $name\n";
+  open(TEXT, ">$name") or die "Can't write $base.txt: $!\n";
+  binmode(TEXT);
+  print TEXT join("", @{$files[$i]});
+  close(TEXT);
+}
+
+exit(0) unless $graph;
+
+# Plotting a graph of the normalised results:
+
+my @diff  = ();
+# Normalise as percentages of the average:
+for my $i (0..$points-1) {
+  $diff[$i] = 100 * ($hi[$i] / $avhi - $lo[$i] / $avlo);
+}
+
+open(OUT, ">$base.dat") or die;
+foreach my $i (0..$points-1) {
+  print OUT "$i $diff[$i]\n";
+  #print OUT "$i $bit[$i]\n";
+}
+close(OUT);
+
+open(PLOT, "|gnuplot") or die;
+print PLOT <<EOF;
+set term post color "Courier" 12
+set output "$base-$window.ps"
+set size 1,1
+set nokey
+set style data line
+set xlabel "Time (1 step = $step samples)"
+set ylabel "2400Hz component - 1200Hz component"
+#set xrange [0:15]
+#set yrange [0:1000]
+set title "Spectrum Analysis" font "Courier,14"
+set grid xtics ytics
+set style fill solid 0.25 border
+#set style fill solid 1
+plot "$base.dat" using 1:2 with boxes
+#plot "$base.dat" using 1:2 with lines
+EOF
+close(PLOT);
+
+print "Done.\n";
+
+sub average($) {
+  my ($data) = @_;
+  return(0) unless @$data;
+  my $total = 0;
+  $total += $_ for (@$data);
+  return ($total / @$data);
+}
+
+sub new_file() {
+  if (@text > 0) {
+    print "Writing ", $#text + 1, " bytes to file.\n\n";
+    push(@files, [@text]);
+    @text = ();
+  }
+}
