@@ -78,7 +78,7 @@ Using the welch window function can help since it gives more weighting to the ce
 
 (4) Use a welch window. For example: tape-read hi=1120 lo=560 baud=1120 resample=128 steps=32 window=welch file.wav
 
-#The big challenge: Rádio USP - Clip Informática - Episode: 102
+# The big challenge: Rádio USP - Clip Informática - Episode: 102
 
 The challenge was to load the data from an old brazilian radio program which aired some MSX code: Rádio USP - Clip Informática - Episode: 102
 
