@@ -1,6 +1,3 @@
-# msx-tape-read
-MSX tape wav file to text decoder
-
 # MSX tape wav file to text decoder
  Copyright (C) 2021 Weber Kai.
  Email: weberkai@yahoo.com.br
