@@ -82,8 +82,9 @@ Using the welch window function can help since it gives more weighting to the ce
 
 The challenge was to load the data from an old brazilian radio program which aired some MSX code: Rádio USP - Clip Informática - Episode: 102
 
-The data starts at 25m00s from this video: https://www.youtube.com/watch?v=QSzMP64DPnI
+But the audio available was low and accelerated.
 
+The data starts at 25m00s from this video: https://www.youtube.com/watch?v=QSzMP64DPnI
 
 First download the mp4 video from YT, then extract the aac audio with:
 
