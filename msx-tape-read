@@ -314,54 +314,21 @@ foreach my $i (0..$points-1) {
     # Frequencies should be centred on n1
     # Add either side to handle speed variations:
 
-    $lo[$i] = $$spectrum[$lo_freq_n1 - 1]
-                + $$spectrum[$lo_freq_n1]
-                + $$spectrum[$lo_freq_n1 + 1];
-    $hi[$i] = $$spectrum[$hi_freq_n1 - 1]
-                + $$spectrum[$hi_freq_n1]
-                + $$spectrum[$hi_freq_n1 + 1];
+    $lo[$i] = $$spectrum[$lo_freq_n1];
+    $hi[$i] = $$spectrum[$hi_freq_n1];
   }
 
 } # next $i
-
 print "\n";
 
 # We have finished with @data, so free the memory:
 #undef @data;
 
-print "\n";
-print "Normalising Spectrum Analysis Points\n";
-
-# "Normalise" @lo and @hi
 my $avlo = average(\@lo);
-print "lo average = $avlo\n";
+printf "lo average = %.3f\n", $avlo;
 my $avhi = average(\@hi);
-print "hi average = $avhi\n";
-
-# Delete initial points until we find a step where either $lo or $hi
-# is at least 10% of the average:
-$n = 0;
-$n++ while ($lo[$n] < $avlo/10) && ($hi[$n] < $avhi/10);
-
-if ($n > 0) {
-  print "Skipping initial $n points (", $n * $step, " samples)\n";
-  splice(@lo, 0, $n);
-  splice(@hi, 0, $n);
-  $points -= $n;
-}
-
-# Delete final points until we find a step where either $lo or $hi
-# is at least 10% of the average:
-$n = $points - 1;
-$n-- while ($lo[$n] < $avlo/10) && ($hi[$n] < $avhi/10);
-$n = $points - 1 - $n;
-
-if ($n > 0) {
-  print "Skipping final $n points (", $n * $step, " samples)\n";
-  splice(@lo, -$n);
-  splice(@hi, -$n);
-  $points -= $n;
-}
+printf "hi average = %.3f\n", $avhi;
+print "\n";
 
 # Use the averages to determine (roughly) which points are low
 # and which are high.
@@ -394,63 +361,38 @@ foreach my $j (1..5) {
   printf "lo average = %.3f over %d points\n", $avlo, $lo_num;
   printf "hi average = %.3f over %d points\n", $avhi, $hi_num;
 }
-if (($lo_num * 100 / ($lo_num + $hi_num) < 8)
-    || ($hi_num * 100 / ($lo_num + $hi_num) < 8)) {
-  print "Iteration failed to converge to sensible values, restoring:\n";
-  $avlo = average(\@lo);
-  printf "lo average = %.3f\n", $avlo;
-  $avhi = average(\@hi);
-  printf "hi average = %.3f\n", $avhi;
-}
 print "\n";
-
-#$avlo = average(\@lo);$avhi = average(\@hi);
 
 # Compute the sequence of bit points:
 my @bit = ();
 for my $i (0..$points-1) {
-  if ($lo[$i] / $avlo > $hi[$i] / $avhi) {
-    $bit[$i] = 0;
-  } else {
+  if ($hi[$i] / $avhi >= 0.1 && $hi[$i] / $avhi >= $lo[$i] / $avlo) {
     $bit[$i] = 1;
+  } else {
+    $bit[$i] = 0;
   }
 }
 
-#$avlo = average(\@lo);$avhi = average(\@hi);
-
-# Now we analyse the resulting sequence of bit points:
-# First, "smooth" the result by fixing isolated points, pairs or triples
-# (a single data bit should cover up to $steps points):
-
-if (!$graph) {
-  if ($steps >= 3) {
-    foreach my $i (1..$points-2) {
-      if (($bit[$i-1] != $bit[$i]) && ($bit[$i] != $bit[$i+1])) {
-        $bit[$i] = $bit[$i-1];
-      }
-    }
+# Smooth the data, but make 1 bits a little larger:
+my $sumbit = 0;
+my @summerbit = ();
+my $start = int($bit_width/2);
+foreach my $i (-$start..$points-1+$start) {
+  print "\rStep ", $i + 1, " of $points points" if ((($i + 1) % 1000) == 0);
+  my $curbit = 0;
+  if (0 <= $i && $i <= $points-1) {
+    $curbit = $bit[$i];
+    $sumbit += $curbit;
   }
-  if ($steps >= 5) {
-    foreach my $i (1..$points-3) {
-      if (($bit[$i-1] != $bit[$i]) && ($bit[$i] == $bit[$i+1])
-            && ($bit[$i] != $bit[$i+2])) {
-        $bit[$i] = $bit[$i-1];
-        $bit[$i+1] = $bit[$i-1];
-      }
-    }
-  }
-  if ($steps >= 9) {
-    foreach my $i (1..$points-3) {
-      if (($bit[$i-1] != $bit[$i]) && ($bit[$i] == $bit[$i+1])
-            && ($bit[$i] == $bit[$i+2]) && ($bit[$i] != $bit[$i+3])) {
-        $bit[$i] = $bit[$i-1];
-        $bit[$i+1] = $bit[$i-1];
-        $bit[$i+2] = $bit[$i-1];
-      }
-    }
+  push @summerbit, $curbit;
+  if ($start <= $i) {
+    $sumbit -= shift @summerbit;
+    $bit[$i-$start] = $sumbit / @summerbit >= 0.4 ? 1 : 0;
   }
 }
+print "\n";
 
+# Decode:
 my $p = 0;      # Current posn
 my @files = (); # Assume files are separated by > 10 frames of carrier
 my @text = ();  # Decoded data characters
