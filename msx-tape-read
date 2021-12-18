@@ -387,7 +387,7 @@ foreach my $i (-$start..$points-1+$start) {
   push @summerbit, $curbit;
   if ($start <= $i) {
     $sumbit -= shift @summerbit;
-    $bit[$i-$start] = $sumbit / @summerbit >= 0.4 ? 1 : 0;
+    $bit[$i-$start] = $sumbit / @summerbit >= 0.45 ? 1 : 0;
   }
 }
 print "\n";
