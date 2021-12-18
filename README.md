@@ -94,9 +94,7 @@ Then convert aac to wav:
 
     ffmpeg -i MSX.aac MSX.wav
 
-In Audacity cut only the MSX tape data
-
-Finally use this code to read the data
+In Audacity crop only the MSX tape data, finally use this code to read the data
 
     perl msx-tape-read baud=1230 hi=2460 lo=1230 window=welch MSX.wav
  
