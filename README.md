@@ -98,6 +98,6 @@ In Audacity cut only the MSX tape data
 
 Finally use this code to read the data
 
-    perl msx-tape-read baud=1250 hi=2500 lo=1250 window=welch MSX.wav
+    perl msx-tape-read baud=1230 hi=2460 lo=1230 window=welch MSX.wav
  
 You should have 6 files now each one corresponding to the data inside each tape block.
