@@ -78,7 +78,7 @@
 # ffmpeg -i MSX.aac MSX.wav
 # In Audacity cut only the MSX tape data
 # Finally use this code to read the data
-# perl taperead/tape-read baud=1250 hi=2500 lo=1250 window=welch MSX.wav
+# perl taperead/tape-read baud=1230 lo=1230 hi=2460 window=welch MSX.wav
 # You should have 6 files now each one corresponding to a tape block
 
 use strict;
@@ -343,14 +343,16 @@ foreach my $j (1..5) {
   $hi_tot = 0;
   $hi_num = 0;
   for my $i (0..$points-1) {
-    if ($lo[$i]/$avlo > $hi[$i]/$avhi) {
-      # Low point
-      $lo_tot += $lo[$i];
-      $lo_num++;
-    } else {
-      # High point
-      $hi_tot += $hi[$i];
-      $hi_num++;
+    if ($hi[$i] / $avhi >= 0.1 && $lo[$i] / $avlo >= 0.1) {
+      if ($lo[$i]/$avlo > $hi[$i]/$avhi) {
+        # Low point
+        $lo_tot += $lo[$i];
+        $lo_num++;
+      } else {
+        # High point
+        $hi_tot += $hi[$i];
+        $hi_num++;
+      }
     }
   }
   last unless $lo_num && $hi_num;
@@ -373,7 +375,7 @@ for my $i (0..$points-1) {
   }
 }
 
-# Smooth the data, but make 1 bits a little larger:
+# Smooth the data
 my $sumbit = 0;
 my @summerbit = ();
 my $start = int($bit_width/2);
@@ -387,7 +389,7 @@ foreach my $i (-$start..$points-1+$start) {
   push @summerbit, $curbit;
   if ($start <= $i) {
     $sumbit -= shift @summerbit;
-    $bit[$i-$start] = $sumbit / @summerbit >= 0.45 ? 1 : 0;
+    $bit[$i-$start] = int($sumbit / @summerbit + 0.5);
   }
 }
 print "\n";
